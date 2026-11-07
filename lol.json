@@ -1,7 +1,7 @@
 {
   "id": "monoschinos",
   "name": "MonosChinos",
-  "version": "3.10.4-app",
+  "version": "4.10.4-app",
   "description": "Anime subtitulado en español (MonosChinos). Adaptado del plugin Kino: búsqueda, catálogo, fichas y servidores (MixDrop, Mp4Upload, Voe, etc.).",
   "author": "adaptado",
   "entry": "plugin.js",
