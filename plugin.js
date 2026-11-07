@@ -2357,35 +2357,48 @@ async function appSearch(query) {
 async function getMeta(id, type) {
   id = String(id || '').trim();
   if (!id) return null;
-  // Aceptar a:slug, slug puro, e:slug:n
   var slug = id;
   var am = /^a:(.+)$/.exec(id);
   if (am) slug = am[1];
   var em = /^e:([^:]+):/.exec(id);
   if (em) slug = em[1];
+  // contentId:episode o contentId/episode
+  var parts = slug.split(/[:/]/);
+  if (parts.length >= 2 && /^\d+$/.test(parts[parts.length - 1])) {
+    slug = parts[0];
+  }
   var ref = 'a:' + slug;
   try {
     var data = await episodes(ref);
     if (!data || !data.series) {
-      // películas a veces van como e:slug:1
-      try {
-        data = await episodes('e:' + slug + ':1');
-      } catch (e2) {}
+      try { data = await episodes('a:' + (typeof baseSlug === 'function' ? baseSlug(slug) : slug)); } catch (e2) {}
     }
     var series = (data && data.series) || { title: slug };
     var list = (data && data.episodes) || [];
     var seasonsMap = {};
+    var epMap = {}; // number -> resolve ref e:slug:n
     list.forEach(function (ep) {
       var sn = Number(ep.season || 1) || 1;
+      var n = Number(ep.number || ep.episode || 0) || 0;
       if (!seasonsMap[sn]) seasonsMap[sn] = [];
+      var epRef = String(ep.ref || ('e:' + slug + ':' + n));
+      if (n) epMap[String(n)] = epRef;
       seasonsMap[sn].push({
-        number: Number(ep.number || ep.episode || 0) || 0,
-        id: String(ep.ref || ('e:' + slug + ':' + (ep.number || 0))),
-        title: ep.title || ('Episodio ' + (ep.number || '')),
+        number: n,
+        id: epRef,
+        title: ep.title || ('Episodio ' + n),
         overview: ep.overview || ep.description || null,
         still: ep.still || ep.image || ep.poster || null,
       });
     });
+    try {
+      if (typeof cacheSet === 'function') {
+        cacheSet('epmap:' + slug, JSON.stringify(epMap), 6 * 3600 * 1000);
+        if (typeof baseSlug === 'function') {
+          cacheSet('epmap:' + baseSlug(slug), JSON.stringify(epMap), 6 * 3600 * 1000);
+        }
+      }
+    } catch (e) {}
     var seasons = Object.keys(seasonsMap)
       .map(Number)
       .sort(function (a, b) { return a - b; })
@@ -2396,89 +2409,259 @@ async function getMeta(id, type) {
           episodes: seasonsMap[sn].sort(function (a, b) { return a.number - b.number; }),
         };
       });
-    var isMovie = String(type || '').toLowerCase() === 'movie' || (list.length === 1 && /pel/i.test(String(series.title || '')));
-    var out = {
+    var totalEps = list.length;
+    var isMovie =
+      String(type || '').toLowerCase() === 'movie' ||
+      (totalEps <= 1 && /pel/i.test(String(series.title || '')));
+    return {
       id: slug,
       title: series.title || slug,
-      type: isMovie && seasons.length <= 1 && (seasons[0] && seasons[0].episodes.length <= 1) ? 'movie' : 'series',
+      type: isMovie ? 'movie' : 'series',
       poster: series.poster || null,
       backdrop: series.backdrop || null,
       overview: series.overview || null,
       year: series.year ? String(series.year) : null,
       seasons: seasons,
-      extra: { ref: ref },
+      extra: { ref: ref, epMap: epMap },
     };
-    return out;
   } catch (e) {
     kino.log('getMeta: ' + ((e && e.message) || e));
     return {
       id: slug,
-      title: slug.replace(/-/g, ' '),
+      title: String(slug).replace(/-/g, ' '),
       type: 'series',
       seasons: [],
     };
   }
 }
 
+function _slugCandidates(slug) {
+  var out = [];
+  var add = function (s) {
+    s = String(s || '').trim();
+    if (!s) return;
+    if (out.indexOf(s) < 0) out.push(s);
+  };
+  add(slug);
+  if (typeof baseSlug === 'function') add(baseSlug(slug));
+  // con/sin -sub-espanol
+  if (/sub-espanol$/i.test(slug)) add(slug.replace(/-?sub-espanol$/i, ''));
+  else add(slug + '-sub-espanol');
+  if (typeof baseSlug === 'function') {
+    var b = baseSlug(slug);
+    if (/sub-espanol$/i.test(b)) add(b.replace(/-?sub-espanol$/i, ''));
+    else add(b + '-sub-espanol');
+  }
+  return out;
+}
+
+function _episodeNum(id, season, episode) {
+  if (episode != null && episode !== '' && !isNaN(Number(episode))) return Number(episode);
+  var s = String(id || '');
+  var m = /[/:e](\d+)$/i.exec(s) || /episodio-(\d+)/i.exec(s) || /E(\d+)/i.exec(s);
+  if (m) return parseInt(m[1], 10);
+  return 1;
+}
+
+function _lookupEpRef(slug, num) {
+  try {
+    var keys = _slugCandidates(slug);
+    for (var i = 0; i < keys.length; i++) {
+      var raw = typeof cacheGet === 'function' ? cacheGet('epmap:' + keys[i]) : null;
+      if (!raw) continue;
+      var map = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (map && map[String(num)]) return String(map[String(num)]);
+    }
+  } catch (e) {}
+  return null;
+}
+
+/** Extrae servidores de una página /ver/slug-episodio-n sin quedarse solo en resolve(). */
+async function _streamsFromEpisodePage(slug, num) {
+  var serversOut = [];
+  var seenUrl = {};
+  var page;
+  try {
+    page = await getPage(BASE + '/ver/' + slug + '-episodio-' + num, null, 16000);
+  } catch (e) {
+    kino.log('episode page ' + slug + '-' + num + ': ' + ((e && e.message) || e));
+    return serversOut;
+  }
+  var list = [];
+  try {
+    list = listServers(page.html) || [];
+  } catch (e) {
+    kino.log('listServers: ' + ((e && e.message) || e));
+    return serversOut;
+  }
+  kino.log('servers on page ' + slug + '-' + num + ': ' + list.map(function (s) { return s.name + '(' + s.kind + ')'; }).join(', '));
+
+  // Resolver en paralelo (límite 4), priorizando los que no necesitan captura
+  var order = list.map(function (s, i) { return i; }).sort(function (a, b) {
+    var ka = list[a].kind, kb = list[b].kind;
+    var ca = (ka === 'filemoon' || ka === 'hexload' || ka === 'voe') ? 1 : 0;
+    var cb = (kb === 'filemoon' || kb === 'hexload' || kb === 'voe') ? 1 : 0;
+    return ca - cb || a - b;
+  });
+
+  await mapLimit(order, 4, async function (i) {
+    var s = list[i];
+    try {
+      // noCap=true primero (fetch); si falla, streamFor con captura (suele fallar en app)
+      var st = null;
+      try {
+        st = await streamFor(s, true);
+      } catch (e1) {
+        try {
+          st = await streamFor(s, false);
+        } catch (e2) {
+          kino.log('stream fail ' + s.kind + ': ' + ((e2 && e2.message) || e2));
+          return;
+        }
+      }
+      if (!st || !st.url) return;
+      if (seenUrl[st.url]) return;
+      seenUrl[st.url] = true;
+      var label = (typeof serverLabel === 'function' ? serverLabel(s, list) : null) || s.name || s.kind || 'Servidor';
+      if (typeof withQ === 'function') label = withQ(label, st.q);
+      serversOut.push({
+        name: label,
+        url: st.url,
+        quality: st.q ? (String(st.q) + 'p') : (label || ''),
+        isHls: /\.m3u8(\?|$)/i.test(st.url) || /[?&]type=m3u8\b/i.test(st.url),
+        headers: st.headers || { Referer: (typeof originOf === 'function' ? originOf(s.url) : BASE) + '/', 'User-Agent': (typeof UA !== 'undefined' ? UA : '') },
+      });
+    } catch (e) {
+      kino.log('stream ' + (s && s.kind) + ': ' + ((e && e.message) || e));
+    }
+  });
+  return serversOut;
+}
+
 async function getStreams(id, type, season, episode) {
+  // Compat: getStreams({ id, type, season, episode })
+  if (id && typeof id === 'object' && !Array.isArray(id)) {
+    var o = id;
+    episode = o.episode != null ? o.episode : episode;
+    season = o.season != null ? o.season : season;
+    type = o.type != null ? o.type : type;
+    id = o.id || o.contentId || o.slug || '';
+  }
   id = String(id || '').trim();
   var slug = id;
   var am = /^a:(.+)$/.exec(id);
   if (am) slug = am[1];
-  var em = /^e:([^:]+):(\d+)/.exec(id);
+  var em = /^e:([^:]+):(\d+)$/.exec(id);
   if (em) {
     slug = em[1];
-    if (episode == null) episode = parseInt(em[2], 10);
+    if (episode == null || episode === '') episode = parseInt(em[2], 10);
   }
-  // id puede venir como contentId/episode desde la app
+  // slug:season:episode o slug/episode
+  var seParts = slug.split(':');
+  if (seParts.length >= 3 && /^\d+$/.test(seParts[seParts.length - 1])) {
+    if (episode == null) episode = parseInt(seParts[seParts.length - 1], 10);
+    slug = seParts[0];
+  } else if (seParts.length === 2 && /^\d+$/.test(seParts[1])) {
+    if (episode == null) episode = parseInt(seParts[1], 10);
+    slug = seParts[0];
+  }
   var slash = id.split('/');
   if (slash.length >= 2 && /^\d+$/.test(slash[slash.length - 1])) {
-    slug = slash[0];
+    slug = slash.slice(0, -1).join('/');
+    // si slug era solo id/ep
+    var only = id.split('/');
+    if (only.length === 2) slug = only[0];
     if (episode == null) episode = parseInt(slash[slash.length - 1], 10);
   }
-  var num = Number(episode || 1) || 1;
-  var ref = 'e:' + slug + ':' + num;
+
+  var num = _episodeNum(id, season, episode);
+  // Película sin episodio → 1
+  if ((!num || num < 1) && String(type || '').toLowerCase() === 'movie') num = 1;
+  if (!num || num < 1) num = 1;
+
+  kino.log('getStreams id=' + id + ' type=' + type + ' S' + season + 'E' + episode + ' → slug=' + slug + ' num=' + num);
 
   var servers = [];
-  try {
-    // resolve devuelve UN stream preferido + alternatives con ref diferido
-    var stream = await resolve(ref);
-    if (stream && stream.url) {
-      servers.push({
-        name: stream.label || 'Servidor',
-        url: stream.url,
-        quality: stream.label || '',
-        isHls: /\.m3u8(\?|$)/i.test(stream.url) || /m3u8/i.test(stream.url),
-        headers: stream.headers || {},
-      });
+  var seen = {};
+
+  function merge(list) {
+    (list || []).forEach(function (s) {
+      if (!s || !s.url || seen[s.url]) return;
+      seen[s.url] = true;
+      servers.push(s);
+    });
+  }
+
+  // 1) Ref guardado en getMeta (slug real del /ver/)
+  var mapped = _lookupEpRef(slug, num);
+  var tried = {};
+  async function tryRef(ref) {
+    if (!ref || tried[ref]) return;
+    tried[ref] = true;
+    try {
+      var p = typeof parseResolveRef === 'function' ? parseResolveRef(ref) : null;
+      if (p) {
+        merge(await _streamsFromEpisodePage(p.slug, p.num));
+      }
+    } catch (e) {
+      kino.log('tryRef ' + ref + ': ' + ((e && e.message) || e));
     }
-    // Alternativas: resolver cada ref s:idx:e:slug:num (limitado)
-    var alts = (stream && stream.alternatives) || [];
-    for (var i = 0; i < alts.length && i < 6; i++) {
-      var alt = alts[i];
-      if (!alt || !alt.ref) continue;
+  }
+
+  if (mapped) await tryRef(mapped);
+
+  // 2) Candidatos de slug × número
+  if (servers.length === 0) {
+    var cands = _slugCandidates(slug);
+    for (var i = 0; i < cands.length && servers.length === 0; i++) {
+      merge(await _streamsFromEpisodePage(cands[i], num));
+      if (servers.length === 0) await tryRef('e:' + cands[i] + ':' + num);
+    }
+  }
+
+  // 3) Último recurso: resolve() clásico de Kino
+  if (servers.length === 0) {
+    var refs = [];
+    if (mapped) refs.push(mapped);
+    _slugCandidates(slug).forEach(function (s) { refs.push('e:' + s + ':' + num); });
+    for (var r = 0; r < refs.length && servers.length === 0; r++) {
       try {
-        var st2 = await resolve(alt.ref);
-        if (st2 && st2.url) {
-          servers.push({
-            name: alt.label || st2.label || ('Servidor ' + (i + 2)),
-            url: st2.url,
-            quality: alt.label || st2.label || '',
-            isHls: /\.m3u8(\?|$)/i.test(st2.url),
-            headers: st2.headers || {},
-          });
+        var stream = await resolve(refs[r]);
+        if (stream && stream.url) {
+          merge([{
+            name: stream.label || 'Servidor',
+            url: stream.url,
+            quality: stream.label || '',
+            isHls: /\.m3u8(\?|$)/i.test(stream.url),
+            headers: stream.headers || {},
+          }]);
         }
-      } catch (e2) {
-        kino.log('alt stream: ' + ((e2 && e2.message) || e2));
+        var alts = (stream && stream.alternatives) || [];
+        for (var a = 0; a < alts.length && a < 5; a++) {
+          if (!alts[a] || !alts[a].ref) continue;
+          try {
+            var st2 = await resolve(alts[a].ref);
+            if (st2 && st2.url) {
+              merge([{
+                name: alts[a].label || st2.label || 'Servidor',
+                url: st2.url,
+                quality: alts[a].label || '',
+                isHls: /\.m3u8(\?|$)/i.test(st2.url),
+                headers: st2.headers || {},
+              }]);
+            }
+          } catch (e3) {}
+        }
+      } catch (e) {
+        kino.log('resolve fallback: ' + ((e && e.message) || e));
       }
     }
-  } catch (e) {
-    kino.log('getStreams: ' + ((e && e.message) || e));
   }
+
+  kino.log('getStreams → ' + servers.length + ' servidor(es)');
   return servers;
 }
 
-// Renombrar search de Kino para no chocar con el export
 module.exports = {
   getHome: getHome,
   search: appSearch,
