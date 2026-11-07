@@ -1,0 +1,29 @@
+{
+  "id": "monoschinos",
+  "name": "MonosChinos",
+  "version": "3.10.4-app",
+  "description": "Anime subtitulado en español (MonosChinos). Adaptado del plugin Kino: búsqueda, catálogo, fichas y servidores (MixDrop, Mp4Upload, Voe, etc.).",
+  "author": "adaptado",
+  "entry": "plugin.js",
+  "icon": "icon.png",
+  "color": "#FF9B05",
+  "languages": ["es"],
+  "capabilities": ["home", "search", "meta", "streams", "catalog"],
+  "config": [
+    {
+      "key": "server",
+      "label": "Servidor preferido",
+      "type": "select",
+      "default": "mixdrop",
+      "options": [
+        { "label": "MixDrop", "value": "mixdrop" },
+        { "label": "Mp4Upload", "value": "mp4upload" },
+        { "label": "LuluStream", "value": "lulu" },
+        { "label": "Voe", "value": "voe" },
+        { "label": "SaveFiles", "value": "savefiles" },
+        { "label": "Doodstream", "value": "dood" },
+        { "label": "Filemoon", "value": "filemoon" }
+      ]
+    }
+  ]
+}
